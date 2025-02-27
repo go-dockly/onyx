@@ -322,6 +322,321 @@ slider_handle :: proc(box: Box, shape: int, loc := #caller_location) -> (pressed
 	return
 }
 
+Vertical_Slider_Result :: struct {
+	using input_result: Input_Result,
+}
+
+vertical_slider :: proc(
+	value: ^$T,
+	lower, upper: f64,
+	lower_limit: f64 = 0,
+	upper_limit: f64 = math.F64_MAX,
+	format: string = "%.2f" when intrinsics.type_is_float(T) else "%i",
+	loc := #caller_location,
+) -> (
+	result: Vertical_Slider_Result,
+) where intrinsics.type_is_numeric(T) {
+	if value == nil {
+		return
+	}
+	self := get_object(hash(loc))
+	self.size = {2, 10} * get_current_style().scale  // Note the swapped dimensions
+	if self.variant == nil {
+		self.variant = Slider{}
+		self.flags += {.Sticky_Press, .Sticky_Hover}
+	}
+	extras := &self.variant.(Slider)
+	if do_object(self) {
+		if point_in_box(mouse_point(), self.box) {
+			hover_object(self)
+		}
+
+		if object_was_clicked_in_place(self) {
+			focus_next_object()
+		}
+
+		if .Pressed in self.state.current {
+			if .Pressed not_in self.state.previous {
+				extras.click_value = f64(value^)
+			}
+			// Note: Using y instead of x for movement, and inverting direction since y increases downward
+			new_value := T(
+				clamp(
+					extras.click_value -
+					f64(
+						(global_state.mouse_pos.y - self.click.point.y) /
+						box_height(self.box),
+					) *
+						f64(upper - lower),
+					max(lower, lower_limit),
+					min(upper, upper_limit),
+				),
+			)
+			if value^ != new_value {
+				self.state.current += {.Changed}
+				value^ = new_value
+			}
+			draw_frames(1)
+		}
+		if .Hovered in self.state.current {
+			set_cursor(.Resize_NS)  // Changed to NS resize cursor
+		}
+		if object_is_visible(self) {
+			style := get_current_style()
+			radius := get_current_options().radius
+			kn.push_scissor(kn.make_box(self.box, radius))
+			kn.add_box(self.box, paint = style.color.button_background)
+			
+			// Note: Using bottom part of box for the filled portion (since y increases downward)
+			value_percentage := f32(clamp((f64(value^) - lower) / (upper - lower), 0, 1))
+			filled_height := box_height(self.box) * value_percentage
+			filled_box := Box{
+				{self.box.lo.x, self.box.hi.y - filled_height},
+				{self.box.hi.x, self.box.hi.y},
+			}
+			kn.add_box(filled_box, paint = style.color.button)
+			
+			// Draw limit markers
+			if lower_limit > lower {
+				y := self.box.hi.y - 
+				     f32((lower_limit - lower) / (upper - lower)) * box_height(self.box)
+				kn.add_line({self.box.lo.x, y}, {self.box.hi.x, y}, 1, style.color.accent)
+			}
+			if upper_limit < upper {
+				y := self.box.hi.y - 
+				     f32((upper_limit - lower) / (upper - lower)) * box_height(self.box)
+				kn.add_line({self.box.lo.x, y}, {self.box.hi.x, y}, 1, style.color.accent)
+			}
+			
+			kn.set_font(style.monospace_font)
+			kn.add_string(
+				fmt.tprintf(format, value^),
+				style.default_text_size,
+				box_center(self.box),
+				align = 0.5,
+				paint = style.color.content,
+			)
+			kn.pop_scissor()
+			kn.add_box_lines(self.box, style.line_width, get_current_options().radius, paint = style.color.button)
+		}
+
+		push_id(self.id)
+		set_next_box(self.box)
+		input(value, format, flags = {.Hidden_Unless_Active, .Select_All})
+		pop_id()
+	}
+	return
+}
+
+Vertical_Range_Slider :: struct {
+	click_value: f64,
+	click_difference: f64,
+	value_index: int,
+}
+
+vertical_range_slider :: proc(
+	lower_value: ^$T,
+	upper_value: ^T,
+	lower, upper: f64,
+	min_gap: f64 = 1,
+	format: string = "%.2f" when intrinsics.type_is_float(T) else "%i",
+	loc := #caller_location,
+) where intrinsics.type_is_numeric(T) {
+	if lower_value == nil || upper_value == nil {
+		return
+	}
+	object := get_object(hash(loc))
+	object.size = {0.75, 1} * get_current_style().scale  // Swapped dimensions
+	if object.variant == nil {
+		object.variant = Vertical_Range_Slider{}
+		object.flags += {.Sticky_Press, .Sticky_Hover}
+	}
+	extras := &object.variant.(Vertical_Range_Slider)
+	if do_object(object) {
+		mouse := mouse_point()
+		is_visible := object_is_visible(object)
+
+		// Note: Calculating positions is flipped for vertical orientation
+		lower_time := clamp((f64(lower_value^) - lower) / (upper - lower), 0, 1)
+		upper_time := clamp((f64(upper_value^) - lower) / (upper - lower), 0, 1)
+		// Y positions are inverted (higher value = lower y position)
+		lower_y := object.box.hi.y - box_height(object.box) * f32(lower_time)
+		upper_y := object.box.hi.y - box_height(object.box) * f32(upper_time)
+		// Determine if mouse is closer to lower or upper handle
+		hovered_index := int(abs(mouse.y - upper_y) < abs(mouse.y - lower_y))
+
+		if .Pressed in object.state.current {
+			if .Shift in object.click.mods {
+				if .Pressed not_in object.state.previous {
+					extras.click_value = f64(lower_value^)
+					extras.click_difference = f64(upper_value^) - f64(lower_value^)
+				}
+				// Invert y direction for calculation
+				value := clamp(
+					extras.click_value -
+					f64((mouse.y - object.click.point.y) / box_height(object.box)) *
+						f64(upper - lower),
+					lower,
+					upper - extras.click_difference,
+				)
+				lower_value^ = T(value)
+				upper_value^ = T(value + extras.click_difference)
+			} else {
+				if .Pressed not_in object.state.previous {
+					extras.value_index = hovered_index
+					extras.click_value = f64(lower_value^ if extras.value_index == 0 else upper_value^)
+				}
+				if extras.value_index == 0 {
+					lower_value^ = T(
+						clamp(
+							extras.click_value -
+							f64((mouse.y - object.click.point.y) / box_height(object.box)) *
+								f64(upper - lower),
+							lower,
+							f64(upper_value^) - min_gap,
+						),
+					)
+				} else {
+					upper_value^ = T(
+						clamp(
+							extras.click_value -
+							f64((mouse.y - object.click.point.y) / box_height(object.box)) *
+								f64(upper - lower),
+							f64(lower_value^) + min_gap,
+							upper,
+						),
+					)
+				}
+			}
+			draw_frames(1)
+		}
+
+		if point_in_box(mouse, object.box) {
+			hover_object(object)
+		}
+
+		if .Hovered in object.state.current {
+			set_cursor(.Resize_NS)  // Changed to NS resize cursor
+		}
+
+		if is_visible {
+			radius := get_current_options().radius
+			kn.push_scissor(kn.make_box(object.box, radius))
+			kn.add_box(object.box, paint = get_current_style().color.field)
+			
+			// Value box is flipped for vertical orientation
+			value_box := Box{{object.box.lo.x, upper_y}, {object.box.hi.x, lower_y}}
+			kn.add_box(
+				value_box,
+				paint = get_current_style().color.button,
+			)
+			
+			if .Hovered in object.state.current {
+				if hovered_index == 0 || key_down(.Left_Shift) {
+					kn.add_box({{value_box.lo.x, value_box.lo.y}, {value_box.hi.x, value_box.lo.y + 1}}, paint = get_current_style().color.accent)
+				}
+				if hovered_index == 1 || key_down(.Left_Shift) {
+					kn.add_box({{value_box.lo.x, value_box.hi.y - 1}, {value_box.hi.x, value_box.hi.y}}, paint = get_current_style().color.accent)
+				}
+			}
+			
+			kn.set_font(get_current_style().monospace_font)
+			kn.add_string(
+				fmt.tprintf(format, upper_value^),
+				get_current_style().default_text_size,
+				{box_center_x(object.box), object.box.lo.y + get_current_style().text_padding.y},
+				align = {0.5, 0},
+				paint = get_current_style().color.content,
+			)
+			kn.add_string(
+				fmt.tprintf(format, lower_value^),
+				get_current_style().default_text_size,
+				{box_center_x(object.box), object.box.hi.y - get_current_style().text_padding.y},
+				align = {0.5, 1},
+				paint = get_current_style().color.content,
+			)
+			kn.pop_scissor()
+			kn.add_box_lines(object.box, 1, get_current_options().radius, paint = get_current_style().color.button)
+
+			push_id(object.id)
+			push_options(default_options())
+
+			was_clicked_in_place := object_was_clicked_in_place(object)
+			center_y := box_center_y(object.box)
+			click_index := int(mouse_point().y > center_y)
+
+			set_next_box({object.box.lo, {object.box.hi.x, center_y}})
+			set_rounded_corners({.Top_Left, .Top_Right})
+			if was_clicked_in_place && click_index == 0 {
+				focus_next_object()
+			}
+			input(upper_value, format, flags = {.Hidden_Unless_Active, .Monospace})
+
+			set_next_box({{object.box.lo.x, center_y}, object.box.hi})
+			set_rounded_corners({.Bottom_Left, .Bottom_Right})
+			if was_clicked_in_place && click_index == 1 {
+				focus_next_object()
+			}
+			input(lower_value, format, flags = {.Hidden_Unless_Active, .Monospace})
+
+			pop_options()
+			pop_id()
+		}
+	}
+	return
+}
+
+vertical_slider_handle :: proc(box: Box, shape: int, loc := #caller_location) -> (pressed, held: bool) {
+	object := get_object(hash(loc))
+	object.flags += {.Sticky_Press, .Sticky_Hover}
+	if begin_object(object) {
+		object.box = box
+		if point_in_box(mouse_point(), object.box) {
+			hover_object(object)
+		}
+		if object_is_visible(object) {
+			vertices: [][2]f32
+			switch shape {
+			case 0:
+				// Rotated from horizontal version
+				vertices = {
+					{object.box.lo.x, object.box.lo.y},
+					object.box.lo + {box_height(object.box), 0},
+					{object.box.hi.x, object.box.lo.y},
+					object.box.hi,
+				}
+			case 1:
+				h := box_height(object.box) / 2
+				vertices = {
+					{object.box.lo.x, object.box.lo.y + h},
+					object.box.lo,
+					{object.box.hi.x, object.box.lo.y},
+					{object.box.hi.x, object.box.hi.y - h},
+					{object.box.lo.x, object.box.hi.y},
+				}
+			case 2:
+				// Rotated from horizontal version
+				vertices = {
+					{object.box.lo.x, object.box.hi.y - box_height(object.box)},
+					{object.box.lo.x, object.box.hi.y},
+					{object.box.hi.x, object.box.hi.y},
+					object.box.hi - {0, box_height(object.box)},
+				}
+			}
+			kn.add_polygon(
+				vertices,
+				paint = get_current_style().color.accent if .Hovered in object.state.current else get_current_style().color.button,
+			)
+		}
+
+		pressed = .Pressed in (object.state.current - object.state.previous)
+		held = .Pressed in object.state.current
+
+		end_object()
+	}
+	return
+}
+
 progress_bar :: proc(time: f32, color: kn.Color = get_current_style().color.accent, loc := #caller_location) {
 	time := clamp(time, 0, 1)
 	object := get_object(hash(loc))
